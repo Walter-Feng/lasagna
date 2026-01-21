@@ -2,8 +2,8 @@
 
 namespace ovlp {
 
-template <int angular>
-__forceinline__ __device__ constexpr double common_fac_sp() {
+template <typename T, int angular>
+__forceinline__ __device__ constexpr T common_fac_sp() {
   if constexpr (angular == 0) {
     return 0.282094791773878143;
   } else if constexpr (angular == 1) {
@@ -13,11 +13,10 @@ __forceinline__ __device__ constexpr double common_fac_sp() {
   }
 }
 
-template <int angular>
+template <typename T, int angular>
 __forceinline__ __device__ void
-vertical_recursion(double result[], const double a00,
-                   const double factor_from_previous,
-                   const double factor_from_second_previous) {
+vertical_recursion(T result[], const T a00, const T factor_from_previous,
+                   const T factor_from_second_previous) {
   result[0] = a00;
   if constexpr (angular > 0) {
     result[1] = factor_from_previous * a00;
@@ -29,9 +28,10 @@ vertical_recursion(double result[], const double a00,
   }
 }
 
-template <int i_angular, int j_angular>
-__forceinline__ __device__ void
-horizontal_recursion(double result[], const double shift_to_here) {
+template <typename T, int i_angular, int j_angular>
+__forceinline__ __device__ void horizontal_recursion(T result[],
+                                                     const T shift_to_here) {
+
   if constexpr (i_angular == 1 && j_angular == 0) {
     result[1] = result[1] + shift_to_here * result[0];
   }
@@ -274,13 +274,12 @@ horizontal_recursion(double result[], const double shift_to_here) {
   }
 }
 
-template <int i_angular, int j_angular>
+template <typename T, int i_angular, int j_angular>
 __forceinline__ __device__ void
-write_spherical_function_pairs(double *output, const double x_pairs[],
-                               const double y_pairs[], const double z_pairs[],
-                               const int n_functions) {
+write_spherical_function_pairs(T *output, const T x_pairs[], const T y_pairs[],
+                               const T z_pairs[], const int n_functions) {
 
-  double expression;
+  T expression;
 
   if constexpr (i_angular == 0 && j_angular == 0) {
     expression = +x_pairs[0] * y_pairs[0] * z_pairs[0];

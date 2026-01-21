@@ -64,79 +64,11 @@ def unique_with_multiple_keys(x):
     return x, inverse_unique[inverse_sort]
 
 
-def get_ovlp_for_single_mol(mol):
-    n_contracted = mol._bas[:, NCTR_OF]
-    n_primitives_per_shell = mol._bas[:, NPRIM_OF]
-    decontracted_basis = np.repeat(mol._bas, n_contracted, axis=0)
-    decontracted_basis[:, NCTR_OF] = 1
-    coeff_offset = np.concatenate(
-        [np.arange(i) * n for i, n in zip(n_contracted, n_primitives_per_shell)]
-    )
-    decontracted_basis[:, PTR_COEFF] += coeff_offset
-    shell_to_ao = make_loc(decontracted_basis, "sph")
-    n_functions = shell_to_ao[-1]
-    shell_to_ao = shell_to_ao[:-1]
-
-    n_primitives_per_shell = np.repeat(n_primitives_per_shell, n_contracted)
-    decontracted_basis = np.repeat(decontracted_basis, n_primitives_per_shell, axis=0)
-    primitive_offset = np.concatenate([np.arange(i) for i in n_primitives_per_shell])
-    decontracted_basis[:, NPRIM_OF] = 1
-    decontracted_basis[:, PTR_COEFF] += primitive_offset
-    decontracted_basis[:, PTR_EXP] += primitive_offset
-    shell_to_ao = np.repeat(shell_to_ao, n_primitives_per_shell)
-
-    n_primitives = decontracted_basis.shape[0]
-    sort_index_by_angular = np.argsort(decontracted_basis[:, ANG_OF])
-    decontracted_basis = decontracted_basis[sort_index_by_angular]
-    shell_to_ao = cp.asarray(shell_to_ao[sort_index_by_angular], dtype=cp.int32)
-
-    left_shells, right_shells = np.triu_indices(n_primitives)
-    n_pairs = len(left_shells)
-    angular_pairs = np.zeros((2, n_pairs), dtype=np.int32)
-    angular_pairs[0] = decontracted_basis[left_shells, ANG_OF]
-    angular_pairs[1] = decontracted_basis[right_shells, ANG_OF]
-
-    groups, indices = unique_with_multiple_keys(angular_pairs.T)
-    sorted_pairs = []
-    for i, group in enumerate(groups):
-        pairs = np.where(indices == i)[0]
-        left_shells_in_this_group = cp.asarray(left_shells[pairs], dtype=cp.int32)
-        right_shells_in_this_group = cp.asarray(right_shells[pairs], dtype=cp.int32)
-        pairs = left_shells_in_this_group * n_primitives + right_shells_in_this_group
-        sorted_pairs.append({"angular_pairs": group, "primitive_pairs": pairs})
-
-    atm = cp.asarray(mol._atm, dtype=cp.int32)
-    env = cp.asarray(mol._env, dtype=cp.double)
-
-    result = cp.zeros((n_functions, n_functions))
-    decontracted_basis = cp.asarray(decontracted_basis, dtype=cp.int32)
-    for pairs in sorted_pairs:
-        i_angular, j_angular = pairs["angular_pairs"]
-        libovlp.overlap(
-            cast_to_pointer(result),
-            cast_to_pointer(pairs["primitive_pairs"]),
-            ctypes.c_int(len(pairs["primitive_pairs"])),
-            ctypes.c_int(n_primitives),
-            cast_to_pointer(shell_to_ao),
-            ctypes.c_int(n_functions),
-            cast_to_pointer(atm),
-            ctypes.c_int(atm.size),
-            cast_to_pointer(decontracted_basis),
-            ctypes.c_int(decontracted_basis.size),
-            cast_to_pointer(env),
-            ctypes.c_int(env.size),
-            ctypes.c_int(1),
-            ctypes.c_int(i_angular),
-            ctypes.c_int(j_angular),
-        )
-
-    return result + result.T
-
-
 def get_ovlp(atms, bases, envs):
     # This assumes that all the molecules have the same basis "structure",
     # with each shell having the same angular momentum, n_primitives, n_contracted,
     # and only differ in the atom assignment and the exponents / coefficients.
+    dtype = envs.dtype
     assert len(atms.shape) == len(bases.shape)
     assert len(envs.shape) == 2
     assert atms.shape[0] == bases.shape[0] == envs.shape[0]
@@ -167,6 +99,7 @@ def get_ovlp(atms, bases, envs):
 
     sort_index_by_angular = np.argsort(decontracted_basis[0, :, ANG_OF])
     decontracted_basis = decontracted_basis[:, sort_index_by_angular]
+
     shell_to_ao = cp.asarray(shell_to_ao[sort_index_by_angular], dtype=cp.int32)
 
     n_primitives = decontracted_basis.shape[-2]
@@ -187,12 +120,18 @@ def get_ovlp(atms, bases, envs):
 
     atms = cp.asarray(atms, dtype=cp.int32)
     bases = cp.asarray(decontracted_basis, dtype=cp.int32)
-    envs = cp.asarray(envs, dtype=cp.double)
+    envs = cp.asarray(envs, dtype=dtype)
 
-    result = cp.zeros((n_configurations, n_functions, n_functions))
+    result = cp.zeros((n_configurations, n_functions, n_functions), dtype=dtype)
+
+    overlap_kernel = libovlp.overlap_double
+    if dtype == np.float32:
+        overlap_kernel = libovlp.overlap_float
+
     for pairs in sorted_pairs:
         i_angular, j_angular = pairs["angular_pairs"]
-        libovlp.overlap(
+
+        overlap_kernel(
             cast_to_pointer(result),
             cast_to_pointer(pairs["primitive_pairs"]),
             ctypes.c_int(len(pairs["primitive_pairs"])),
@@ -219,7 +158,7 @@ mol = Mole(
     atom="""O     0.      0.      0.    
             He    0.      0.      0.    
          """,
-    basis="cc-pvqz",
+    basis="cc-pvdz",
     verbose=0,
 )
 mol.build()
@@ -231,4 +170,13 @@ envs = np.array([mol._env for _ in range(3)])
 assert (
     cp.linalg.norm(get_ovlp(atms, bases, envs) - cp.array(mol.intor("int1e_ovlp")))
     < 1e-10
+)
+
+float_envs = np.array(envs, dtype=np.float32, order="C")
+
+assert (
+    cp.linalg.norm(
+        get_ovlp(atms, bases, float_envs) - cp.array(mol.intor("int1e_ovlp"))
+    )
+    < 1e-5
 )
