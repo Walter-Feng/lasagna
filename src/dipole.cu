@@ -5,19 +5,18 @@
 
 namespace ovlp {
 template <int i_angular, int j_angular>
-__global__ void
-dipole_kernel(double *result, const int *pair_indices, const int n_primitives,
-              const int n_pairs, const int *primitive_to_function,
-              const int n_functions, const int *atm, const int atm_stride,
-              const int *bas, const int bas_stride, const double *env,
-              const int env_stride, const double reference_point_x,
-              const double reference_point_y, const double reference_point_z,
-              const int is_screened) {
+__global__ void dipole_kernel(
+    double *result, const int *pair_indices, const int n_primitives,
+    const int n_pairs, const int *primitive_to_function, const int n_functions,
+    const int *atm, const int atm_stride, const int *bas, const int bas_stride,
+    const double *env, const int env_stride, const double *lattice_vectors,
+    const int *image_indices, const int *mask, const double reference_point_x,
+    const double reference_point_y, const double reference_point_z,
+    const int is_screened, const int reduce_over_images) {
+
+  const int matrix_stride = 3 * n_functions * n_functions;
 
   OVLP_SPELL;
-
-  result += blockIdx.y * 3 * n_functions * n_functions +
-            i_function_index * n_functions + j_function_index;
 
   double x_pairs[(i_angular + 1) * (j_angular + 2)];
   reset(x, 0, 1);
@@ -44,19 +43,18 @@ dipole_kernel(double *result, const int *pair_indices, const int n_primitives,
 }
 
 template <int i_angular, int j_angular>
-__global__ void
-dipole_gradient(double *result, const int *pair_indices, const int n_primitives,
-                const int n_pairs, const int *primitive_to_function,
-                const int n_functions, const int *atm, const int atm_stride,
-                const int *bas, const int bas_stride, const double *env,
-                const int env_stride, const double reference_point_x,
-                const double reference_point_y, const double reference_point_z,
-                const int is_screened) {
+__global__ void dipole_gradient(
+    double *result, const int *pair_indices, const int n_primitives,
+    const int n_pairs, const int *primitive_to_function, const int n_functions,
+    const int *atm, const int atm_stride, const int *bas, const int bas_stride,
+    const double *env, const int env_stride, const double *lattice_vectors,
+    const int *image_indices, const int *mask, const double reference_point_x,
+    const double reference_point_y, const double reference_point_z,
+    const int is_screened, const int reduce_over_images) {
+
+  const int matrix_stride = 9 * n_functions * n_functions;
 
   OVLP_SPELL;
-
-  result += blockIdx.y * 9 * n_functions * n_functions +
-            i_function_index * n_functions + j_function_index;
 
   double x_pairs[(i_angular + 2) * (j_angular + 2)];
   reset(x, 1, 1);
@@ -132,13 +130,15 @@ void dipole(double *result, const int *pair_indices, const int n_pairs,
             const int n_functions, const int *atm, const int atm_stride,
             const int *bas, const int bas_stride, const double *env,
             const int env_stride, const int n_configurations,
-            const int i_angular, const int j_angular,
-            const double reference_point_x, const double reference_point_y,
-            const double reference_point_z, const int is_screened) {
+            const double *lattice_vectors, const int *image_indices,
+            const int n_images, const int *mask, const double reference_point_x,
+            const double reference_point_y, const double reference_point_z,
+            const int i_angular, const int j_angular, const int is_screened,
+            const int reduce_over_images) {
 
   const dim3 block_size{256, 1, 1};
   const dim3 block_grid{(uint)((n_pairs + 255) / 256), (uint)n_configurations,
-                        1};
+                        (uint)n_images};
 
   switch (i_angular * 10 + j_angular) {
     tabulate_multipole(ovlp::dipole_kernel);
@@ -150,14 +150,17 @@ void dipole_gradient(double *result, const int *pair_indices, const int n_pairs,
                      const int n_functions, const int *atm,
                      const int atm_stride, const int *bas, const int bas_stride,
                      const double *env, const int env_stride,
-                     const int n_configurations, const int i_angular,
-                     const int j_angular, const double reference_point_x,
+                     const int n_configurations, const double *lattice_vectors,
+                     const int *image_indices, const int n_images,
+                     const int *mask, const double reference_point_x,
                      const double reference_point_y,
-                     const double reference_point_z, const int is_screened) {
+                     const double reference_point_z, const int i_angular,
+                     const int j_angular, const int is_screened,
+                     const int reduce_over_images) {
 
   const dim3 block_size{256, 1, 1};
   const dim3 block_grid{(uint)((n_pairs + 255) / 256), (uint)n_configurations,
-                        1};
+                        (uint)n_images};
 
   switch (i_angular * 10 + j_angular) {
     tabulate_multipole(ovlp::dipole_gradient);

@@ -20,7 +20,7 @@ import cupy as cp
 from pyscf.gto.moleintor import make_loc
 
 from pyscf.gto import NPRIM_OF, NCTR_OF, ANG_OF, PTR_EXP, PTR_COEFF
-
+from gpu4pyscf.lib import logger
 
 libovlp = ctypes.CDLL("libovlp.so")
 
@@ -34,7 +34,16 @@ def cast_to_pointer(array):
         raise ValueError("Invalid array type")
 
 
-def create_ovlp_plan(atms, bases, envs, screening=False):
+def create_ovlp_plan(
+    atms,
+    bases,
+    envs,
+    screening=False,
+    lattice_vectors=None,
+    image_indices=None,
+    mask=None,
+    reduce_over_images=True,
+):
     assert len(atms.shape) == len(bases.shape)
     assert len(envs.shape) == 2
     assert atms.shape[0] == bases.shape[0] == envs.shape[0]
@@ -42,7 +51,15 @@ def create_ovlp_plan(atms, bases, envs, screening=False):
     assert np.all(bases[:, :, NCTR_OF] == bases[0, :, NCTR_OF])
     assert np.all(bases[:, :, NPRIM_OF] == bases[0, :, NPRIM_OF])
 
+    log = logger.new_logger(verbose=5)
     n_configurations = atms.shape[0]
+    if lattice_vectors is None:
+        lattice_vectors = np.zeros((3, 3))
+    if image_indices is None:
+        image_indices = np.zeros((1, 3), dtype=np.int32)
+    if mask is None:
+        mask = np.ones((n_configurations, len(image_indices)), dtype=np.int32)
+
     n_contracted = bases[0, :, NCTR_OF]
     n_primitives_per_shell = bases[0, :, NPRIM_OF]
     decontracted_basis = np.repeat(bases, n_contracted, axis=-2)
@@ -81,6 +98,10 @@ def create_ovlp_plan(atms, bases, envs, screening=False):
     atms = cp.asarray(atms, dtype=cp.int32)
     bases = cp.asarray(decontracted_basis, dtype=cp.int32)
     envs = cp.asarray(envs, dtype=cp.double)
+    lattice_vectors = cp.asarray(lattice_vectors, dtype=cp.double)
+    image_indices = cp.asarray(image_indices, dtype=cp.int32)
+    mask = cp.asarray(mask, dtype=cp.int32)
+
     shell_to_ao = cp.asarray(shell_to_ao[sort_index_by_angular], dtype=cp.int32)
 
     pairs = []
@@ -123,6 +144,11 @@ def create_ovlp_plan(atms, bases, envs, screening=False):
     else:
         is_screened = 0
 
+    if reduce_over_images:
+        reduce_over_images = 1
+    else:
+        reduce_over_images = 0
+
     plan = {
         "atms": atms,
         "bases": bases,
@@ -134,15 +160,29 @@ def create_ovlp_plan(atms, bases, envs, screening=False):
         "grouped_primitive_ranges": grouped_primitives_ranges,
         "pairs": pairs,
         "is_screened": is_screened,
+        "lattice_vectors": lattice_vectors,
+        "image_indices": image_indices,
+        "mask": mask,
+        "reduce_over_images": reduce_over_images,
     }
 
     return plan
 
 
 def get_ovlp(plan):
-    result = cp.zeros(
-        (plan["n_configurations"], plan["n_functions"], plan["n_functions"])
-    )
+    if plan["reduce_over_images"]:
+        result = cp.zeros(
+            (plan["n_configurations"], plan["n_functions"], plan["n_functions"])
+        )
+    else:
+        result = cp.zeros(
+            (
+                plan["n_configurations"],
+                len(plan["image_indices"]),
+                plan["n_functions"],
+                plan["n_functions"],
+            )
+        ).reshape(-1, plan["n_functions"], plan["n_functions"])
 
     for i_angular, j_angular, pair_indices, n_pairs in plan["pairs"]:
         libovlp.overlap(
@@ -159,18 +199,44 @@ def get_ovlp(plan):
             cast_to_pointer(plan["envs"]),
             ctypes.c_int(plan["envs"][0].size),
             ctypes.c_int(plan["n_configurations"]),
+            cast_to_pointer(plan["lattice_vectors"]),
+            cast_to_pointer(plan["image_indices"]),
+            ctypes.c_int(plan["image_indices"].size),
+            cast_to_pointer(plan["mask"]),
             ctypes.c_int(i_angular),
             ctypes.c_int(j_angular),
             ctypes.c_int(plan["is_screened"]),
+            ctypes.c_int(plan["reduce_over_images"]),
         )
 
-    return result + result.transpose(0, 2, 1)
+    result += result.transpose(0, 2, 1)
+
+    if not plan["reduce_over_images"]:
+        result = result.reshape(
+            plan["n_configurations"],
+            len(plan["image_indices"]),
+            plan["n_functions"],
+            plan["n_functions"],
+        )
+
+    return result
 
 
 def get_ovlp_gradient(plan):
-    result = cp.zeros(
-        (plan["n_configurations"], 3, plan["n_functions"], plan["n_functions"])
-    )
+    if plan["reduce_over_images"]:
+        result = cp.zeros(
+            (plan["n_configurations"], 3, plan["n_functions"], plan["n_functions"])
+        )
+    else:
+        result = cp.zeros(
+            (
+                plan["n_configurations"],
+                len(plan["image_indices"]),
+                3,
+                plan["n_functions"],
+                plan["n_functions"],
+            )
+        ).reshape(-1, 3, plan["n_functions"], plan["n_functions"])
 
     for i_angular, j_angular, pair_indices, n_pairs in plan["pairs"]:
         libovlp.overlap_gradient(
@@ -187,18 +253,45 @@ def get_ovlp_gradient(plan):
             cast_to_pointer(plan["envs"]),
             ctypes.c_int(plan["envs"][0].size),
             ctypes.c_int(plan["n_configurations"]),
+            cast_to_pointer(plan["lattice_vectors"]),
+            cast_to_pointer(plan["image_indices"]),
+            ctypes.c_int(plan["image_indices"].size),
+            cast_to_pointer(plan["mask"]),
             ctypes.c_int(i_angular),
             ctypes.c_int(j_angular),
             ctypes.c_int(plan["is_screened"]),
+            ctypes.c_int(plan["reduce_over_images"]),
         )
 
-    return result - result.transpose(0, 1, -1, -2)
+    result -= result.transpose(0, 1, -1, -2)
+
+    if not plan["reduce_over_images"]:
+        result = result.reshape(
+            plan["n_configurations"],
+            len(plan["image_indices"]),
+            3,
+            plan["n_functions"],
+            plan["n_functions"],
+        )
+
+    return result
 
 
 def get_dipole(plan, reference_point=(0, 0, 0)):
-    result = cp.zeros(
-        (plan["n_configurations"], 3, plan["n_functions"], plan["n_functions"])
-    )
+    if plan["reduce_over_images"]:
+        result = cp.zeros(
+            (plan["n_configurations"], 3, plan["n_functions"], plan["n_functions"])
+        )
+    else:
+        result = cp.zeros(
+            (
+                plan["n_configurations"],
+                len(plan["image_indices"]),
+                3,
+                plan["n_functions"],
+                plan["n_functions"],
+            )
+        ).reshape(-1, 3, plan["n_functions"], plan["n_functions"])
 
     for i_angular, j_angular, pair_indices, n_pairs in plan["pairs"]:
         libovlp.dipole(
@@ -215,25 +308,60 @@ def get_dipole(plan, reference_point=(0, 0, 0)):
             cast_to_pointer(plan["envs"]),
             ctypes.c_int(plan["envs"][0].size),
             ctypes.c_int(plan["n_configurations"]),
-            ctypes.c_int(i_angular),
-            ctypes.c_int(j_angular),
+            cast_to_pointer(plan["lattice_vectors"]),
+            cast_to_pointer(plan["image_indices"]),
+            ctypes.c_int(plan["mask"].shape[1]),
+            cast_to_pointer(plan["mask"]),
             ctypes.c_double(reference_point[0]),
             ctypes.c_double(reference_point[1]),
             ctypes.c_double(reference_point[2]),
+            ctypes.c_int(i_angular),
+            ctypes.c_int(j_angular),
             ctypes.c_int(plan["is_screened"]),
+            ctypes.c_int(plan["reduce_over_images"]),
         )
 
-    return result + result.transpose(0, 1, -1, -2)
+    result += result.transpose(0, 1, -1, -2)
+
+    if not plan["reduce_over_images"]:
+        result = result.reshape(
+            plan["n_configurations"],
+            len(plan["image_indices"]),
+            3,
+            plan["n_functions"],
+            plan["n_functions"],
+        )
+
+    return result
 
 
 def get_dipole_gradient(plan, reference_point=(0, 0, 0)):
-    result = cp.zeros(
-        (plan["n_configurations"], 9, plan["n_functions"], plan["n_functions"])
-    )
+    if plan["reduce_over_images"]:
+        ovlp = cp.zeros(
+            (plan["n_configurations"], plan["n_functions"], plan["n_functions"])
+        )
+        result = cp.zeros(
+            (plan["n_configurations"], 9, plan["n_functions"], plan["n_functions"])
+        )
 
-    ovlp = cp.zeros(
-        (plan["n_configurations"], plan["n_functions"], plan["n_functions"])
-    )
+    else:
+        ovlp = cp.zeros(
+            (
+                plan["n_configurations"],
+                len(plan["image_indices"]),
+                plan["n_functions"],
+                plan["n_functions"],
+            )
+        ).reshape(-1, plan["n_functions"], plan["n_functions"])
+        result = cp.zeros(
+            (
+                plan["n_configurations"],
+                len(plan["image_indices"]),
+                9,
+                plan["n_functions"],
+                plan["n_functions"],
+            )
+        ).reshape(-1, 9, plan["n_functions"], plan["n_functions"])
 
     for i_angular, j_angular, pair_indices, n_pairs in plan["pairs"]:
         libovlp.overlap(
@@ -250,9 +378,14 @@ def get_dipole_gradient(plan, reference_point=(0, 0, 0)):
             cast_to_pointer(plan["envs"]),
             ctypes.c_int(plan["envs"][0].size),
             ctypes.c_int(plan["n_configurations"]),
+            cast_to_pointer(plan["lattice_vectors"]),
+            cast_to_pointer(plan["image_indices"]),
+            ctypes.c_int(plan["image_indices"].size),
+            cast_to_pointer(plan["mask"]),
             ctypes.c_int(i_angular),
             ctypes.c_int(j_angular),
             ctypes.c_int(plan["is_screened"]),
+            ctypes.c_int(plan["reduce_over_images"]),
         )
 
         libovlp.dipole_gradient(
@@ -269,12 +402,17 @@ def get_dipole_gradient(plan, reference_point=(0, 0, 0)):
             cast_to_pointer(plan["envs"]),
             ctypes.c_int(plan["envs"][0].size),
             ctypes.c_int(plan["n_configurations"]),
-            ctypes.c_int(i_angular),
-            ctypes.c_int(j_angular),
+            cast_to_pointer(plan["lattice_vectors"]),
+            cast_to_pointer(plan["image_indices"]),
+            ctypes.c_int(plan["mask"].shape[1]),
+            cast_to_pointer(plan["mask"]),
             ctypes.c_double(reference_point[0]),
             ctypes.c_double(reference_point[1]),
             ctypes.c_double(reference_point[2]),
+            ctypes.c_int(i_angular),
+            ctypes.c_int(j_angular),
             ctypes.c_int(plan["is_screened"]),
+            ctypes.c_int(plan["reduce_over_images"]),
         )
 
     result -= result.transpose(0, 1, -1, -2)
@@ -287,16 +425,38 @@ def get_dipole_gradient(plan, reference_point=(0, 0, 0)):
         .reshape(plan["n_configurations"], 9, plan["n_functions"], plan["n_functions"])
     )
 
+    if not plan["reduce_over_images"]:
+        result = result.reshape(
+            plan["n_configurations"],
+            len(plan["image_indices"]),
+            9,
+            plan["n_functions"],
+            plan["n_functions"],
+        )
+
     return result
 
 
 def get_quadrupole(plan, reference_point=(0, 0, 0)):
-    result = cp.zeros(
-        (plan["n_configurations"], 9, plan["n_functions"], plan["n_functions"])
-    )
+    if plan["reduce_over_images"]:
+        result = cp.zeros(
+            (plan["n_configurations"], 9, plan["n_functions"], plan["n_functions"])
+        )
+
+    else:
+        result = cp.zeros(
+            (
+                plan["n_configurations"],
+                len(plan["image_indices"]),
+                9,
+                plan["n_functions"],
+                plan["n_functions"],
+            )
+        )
 
     for i_angular, j_angular, pair_indices, n_pairs in plan["pairs"]:
         assert i_angular <= j_angular
+
         libovlp.quadrupole(
             cast_to_pointer(result),
             cast_to_pointer(pair_indices),
@@ -311,28 +471,65 @@ def get_quadrupole(plan, reference_point=(0, 0, 0)):
             cast_to_pointer(plan["envs"]),
             ctypes.c_int(plan["envs"][0].size),
             ctypes.c_int(plan["n_configurations"]),
-            ctypes.c_int(i_angular),
-            ctypes.c_int(j_angular),
+            cast_to_pointer(plan["lattice_vectors"]),
+            cast_to_pointer(plan["image_indices"]),
+            ctypes.c_int(plan["mask"].shape[1]),
+            cast_to_pointer(plan["mask"]),
             ctypes.c_double(reference_point[0]),
             ctypes.c_double(reference_point[1]),
             ctypes.c_double(reference_point[2]),
+            ctypes.c_int(i_angular),
+            ctypes.c_int(j_angular),
             ctypes.c_int(plan["is_screened"]),
+            ctypes.c_int(plan["reduce_over_images"]),
         )
+
     result += result.transpose(0, 1, 3, 2)
 
     result[:, [3, 6, 7]] = result[:, [1, 2, 5]]
+
+    if not plan["reduce_over_images"]:
+        result = result.reshape(
+            plan["n_configurations"],
+            len(plan["image_indices"]),
+            9,
+            plan["n_functions"],
+            plan["n_functions"],
+        )
 
     return result
 
 
 def get_quadrupole_gradient(plan, reference_point=(0, 0, 0)):
-    result = cp.zeros(
-        (plan["n_configurations"], 27, plan["n_functions"], plan["n_functions"])
-    )
+    if plan["reduce_over_images"]:
+        result = cp.zeros(
+            (plan["n_configurations"], 27, plan["n_functions"], plan["n_functions"])
+        )
 
-    dipole = cp.zeros(
-        (plan["n_configurations"], 3, plan["n_functions"], plan["n_functions"])
-    )
+        dipole = cp.zeros(
+            (plan["n_configurations"], 3, plan["n_functions"], plan["n_functions"])
+        )
+
+    else:
+        result = cp.zeros(
+            (
+                plan["n_configurations"],
+                len(plan["image_indices"]),
+                9,
+                plan["n_functions"],
+                plan["n_functions"],
+            )
+        )
+
+        dipole = cp.zeros(
+            (
+                plan["n_configurations"],
+                len(plan["image_indices"]),
+                3,
+                plan["n_functions"],
+                plan["n_functions"],
+            )
+        )
 
     for i_angular, j_angular, pair_indices, n_pairs in plan["pairs"]:
         libovlp.dipole(
@@ -349,12 +546,17 @@ def get_quadrupole_gradient(plan, reference_point=(0, 0, 0)):
             cast_to_pointer(plan["envs"]),
             ctypes.c_int(plan["envs"][0].size),
             ctypes.c_int(plan["n_configurations"]),
-            ctypes.c_int(i_angular),
-            ctypes.c_int(j_angular),
+            cast_to_pointer(plan["lattice_vectors"]),
+            cast_to_pointer(plan["image_indices"]),
+            ctypes.c_int(plan["mask"].shape[1]),
+            cast_to_pointer(plan["mask"]),
             ctypes.c_double(reference_point[0]),
             ctypes.c_double(reference_point[1]),
             ctypes.c_double(reference_point[2]),
+            ctypes.c_int(i_angular),
+            ctypes.c_int(j_angular),
             ctypes.c_int(plan["is_screened"]),
+            ctypes.c_int(plan["reduce_over_images"]),
         )
 
         libovlp.quadrupole_gradient(
@@ -371,12 +573,17 @@ def get_quadrupole_gradient(plan, reference_point=(0, 0, 0)):
             cast_to_pointer(plan["envs"]),
             ctypes.c_int(plan["envs"][0].size),
             ctypes.c_int(plan["n_configurations"]),
-            ctypes.c_int(i_angular),
-            ctypes.c_int(j_angular),
+            cast_to_pointer(plan["lattice_vectors"]),
+            cast_to_pointer(plan["image_indices"]),
+            ctypes.c_int(plan["mask"].shape[1]),
+            cast_to_pointer(plan["mask"]),
             ctypes.c_double(reference_point[0]),
             ctypes.c_double(reference_point[1]),
             ctypes.c_double(reference_point[2]),
+            ctypes.c_int(i_angular),
+            ctypes.c_int(j_angular),
             ctypes.c_int(plan["is_screened"]),
+            ctypes.c_int(plan["reduce_over_images"]),
         )
 
     result -= result.transpose(0, 1, -1, -2)
@@ -393,5 +600,14 @@ def get_quadrupole_gradient(plan, reference_point=(0, 0, 0)):
         .transpose(0, 2, 1, 3, 4)
         .reshape(plan["n_configurations"], 27, plan["n_functions"], plan["n_functions"])
     )
+
+    if not plan["reduce_over_images"]:
+        result = result.reshape(
+            plan["n_configurations"],
+            len(plan["image_indices"]),
+            27,
+            plan["n_functions"],
+            plan["n_functions"],
+        )
 
     return result

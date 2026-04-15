@@ -27,6 +27,11 @@
   atm += blockIdx.y * atm_stride;                                              \
   bas += blockIdx.y * bas_stride;                                              \
   env += blockIdx.y * env_stride;                                              \
+  mask += blockIdx.y * gridDim.z;                                              \
+  lattice_vectors += blockIdx.y * 9;                                           \
+  if (mask[blockIdx.z] == 0) {                                                 \
+    return;                                                                    \
+  }                                                                            \
   int pair_idx = blockIdx.x * blockDim.x + threadIdx.x;                        \
   if (pair_idx >= n_pairs)                                                     \
     return;                                                                    \
@@ -70,12 +75,21 @@
   const int j_atom = bas(ATOM_OF, j_primitive);                                \
   const int i_coord_offset = atm(PTR_COORD, i_atom);                           \
   const int j_coord_offset = atm(PTR_COORD, j_atom);                           \
+  const int image_shift_a = image_indices[3 * blockIdx.z];                     \
+  const int image_shift_b = image_indices[3 * blockIdx.z + 1];                 \
+  const int image_shift_c = image_indices[3 * blockIdx.z + 2];                 \
   const double i_x = env[i_coord_offset + 0];                                  \
   const double i_y = env[i_coord_offset + 1];                                  \
   const double i_z = env[i_coord_offset + 2];                                  \
-  const double j_x = env[j_coord_offset + 0];                                  \
-  const double j_y = env[j_coord_offset + 1];                                  \
-  const double j_z = env[j_coord_offset + 2];                                  \
+  const double j_x =                                                           \
+      env[j_coord_offset + 0] + image_shift_a * lattice_vectors[0] +           \
+      image_shift_b * lattice_vectors[3] + image_shift_c * lattice_vectors[6]; \
+  const double j_y =                                                           \
+      env[j_coord_offset + 1] + image_shift_a * lattice_vectors[1] +           \
+      image_shift_b * lattice_vectors[4] + image_shift_c * lattice_vectors[7]; \
+  const double j_z =                                                           \
+      env[j_coord_offset + 2] + image_shift_a * lattice_vectors[2] +           \
+      image_shift_b * lattice_vectors[5] + image_shift_c * lattice_vectors[8]; \
   const double ix_to_jx = j_x - i_x;                                           \
   const double iy_to_jy = j_y - i_y;                                           \
   const double iz_to_jz = j_z - i_z;                                           \
@@ -95,7 +109,11 @@
   const int j_function_index = primitive_to_function[j_primitive];             \
                                                                                \
   const double factor_a = -alpha / pair_exponent;                              \
-  const double factor_b = 0.5 / pair_exponent;
+  const double factor_b = 0.5 / pair_exponent;                                 \
+  const int configuration_stride = reduce_over_images ? 1 : gridDim.z;         \
+  result += blockIdx.y * configuration_stride * matrix_stride +                \
+            blockIdx.z * (1 - reduce_over_images) * matrix_stride +            \
+            i_function_index * n_functions + j_function_index;
 
 #define reset(axis, bra_padding, ket_padding)                                  \
   rr::fill_with_recursion<i_angular + bra_padding, j_angular + ket_padding>(   \
@@ -125,7 +143,8 @@
     kernel<i, j><<<block_grid, block_size>>>(                                  \
         result, pair_indices, n_primitives, n_pairs, primitive_to_function,    \
         n_functions, atm, atm_stride, bas, bas_stride, env, env_stride,        \
-        is_screened);                                                          \
+        lattice_vectors, image_indices, mask, is_screened,                     \
+        reduce_over_images);                                                   \
     break;
 
 #define multipole_kernel_macro(kernel, i, j)                                   \
@@ -133,7 +152,9 @@
     kernel<i, j><<<block_grid, block_size>>>(                                  \
         result, pair_indices, n_primitives, n_pairs, primitive_to_function,    \
         n_functions, atm, atm_stride, bas, bas_stride, env, env_stride,        \
-        reference_point_x, reference_point_y, reference_point_z, is_screened); \
+        lattice_vectors, image_indices, mask, reference_point_x,               \
+        reference_point_y, reference_point_z, is_screened,                     \
+        reduce_over_images);                                                   \
     break;
 
 // tabulator

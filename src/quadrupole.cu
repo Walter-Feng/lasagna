@@ -9,14 +9,14 @@ __global__ void quadrupole_kernel(
     double *result, const int *pair_indices, const int n_primitives,
     const int n_pairs, const int *primitive_to_function, const int n_functions,
     const int *atm, const int atm_stride, const int *bas, const int bas_stride,
-    const double *env, const int env_stride, const double reference_point_x,
+    const double *env, const int env_stride, const double *lattice_vectors,
+    const int *image_indices, const int *mask, const double reference_point_x,
     const double reference_point_y, const double reference_point_z,
-    const int is_screened) {
+    const int is_screened, const int reduce_over_images) {
+
+  const int matrix_stride = 9 * n_functions * n_functions;
 
   OVLP_SPELL;
-
-  result += blockIdx.y * 9 * n_functions * n_functions +
-            i_function_index * n_functions + j_function_index;
 
   double x_pairs[(i_angular + 1) * (j_angular + 3)];
   reset(x, 0, 2);
@@ -70,14 +70,14 @@ __global__ void quadrupole_gradient(
     double *result, const int *pair_indices, const int n_primitives,
     const int n_pairs, const int *primitive_to_function, const int n_functions,
     const int *atm, const int atm_stride, const int *bas, const int bas_stride,
-    const double *env, const int env_stride, const double reference_point_x,
+    const double *env, const int env_stride, const double *lattice_vectors,
+    const int *image_indices, const int *mask, const double reference_point_x,
     const double reference_point_y, const double reference_point_z,
-    const int is_screened) {
+    const int is_screened, const int reduce_over_images) {
+
+  const int matrix_stride = 27 * n_functions * n_functions;
 
   OVLP_SPELL;
-
-  result += blockIdx.y * 27 * n_functions * n_functions +
-            i_function_index * n_functions + j_function_index;
 
   double x_pairs[(i_angular + 2) * (j_angular + 3)];
   reset(x, 1, 2);
@@ -228,13 +228,16 @@ void quadrupole(double *result, const int *pair_indices, const int n_pairs,
                 const int n_functions, const int *atm, const int atm_stride,
                 const int *bas, const int bas_stride, const double *env,
                 const int env_stride, const int n_configurations,
-                const int i_angular, const int j_angular,
+                const double *lattice_vectors, const int *image_indices,
+                const int n_images, const int *mask,
                 const double reference_point_x, const double reference_point_y,
-                const double reference_point_z, const int is_screened) {
+                const double reference_point_z, const int i_angular,
+                const int j_angular, const int is_screened,
+                const int reduce_over_images) {
 
   const dim3 block_size{256, 1, 1};
   const dim3 block_grid{(uint)((n_pairs + 255) / 256), (uint)n_configurations,
-                        1};
+                        (uint)n_images};
 
   switch (i_angular * 10 + j_angular) {
     tabulate_multipole(ovlp::quadrupole_kernel);
@@ -246,13 +249,15 @@ void quadrupole_gradient(
     const int n_primitives, const int *primitive_to_function,
     const int n_functions, const int *atm, const int atm_stride, const int *bas,
     const int bas_stride, const double *env, const int env_stride,
-    const int n_configurations, const int i_angular, const int j_angular,
+    const int n_configurations, const double *lattice_vectors,
+    const int *image_indices, const int n_images, const int *mask,
     const double reference_point_x, const double reference_point_y,
-    const double reference_point_z, const int is_screened) {
+    const double reference_point_z, const int i_angular, const int j_angular,
+    const int is_screened, const int reduce_over_images) {
 
   const dim3 block_size{256, 1, 1};
   const dim3 block_grid{(uint)((n_pairs + 255) / 256), (uint)n_configurations,
-                        1};
+                        (uint)n_images};
 
   switch (i_angular * 10 + j_angular) {
     tabulate_multipole(ovlp::quadrupole_gradient);
